@@ -33,6 +33,14 @@ CREDENTIALS = "GOOGLE_APPLICATION_CREDENTIALS"
 """Environment variable defining the location of Google application default
 credentials."""
 
+CREDENTIALS_JSON = "GOOGLE_APPLICATION_CREDENTIALS_JSON"
+"""Environment variable defining the base64 encoded service account or user
+credentials JSON content."""
+
+OAUTH_ACCESS_TOKEN = "GOOGLE_OAUTH_ACCESS_TOKEN"
+"""Environment variable defining the access token to be used directly as
+the credentials."""
+
 # The environment variable name which can replace ~/.config if set.
 CLOUD_SDK_CONFIG_DIR = "CLOUDSDK_CONFIG"
 """Environment variable defines the location of Google Cloud SDK's config

@@ -17,6 +17,8 @@
 Implements application default credentials and project ID detection.
 """
 
+import base64
+import binascii
 import io
 import json
 import logging
@@ -73,6 +75,109 @@ def _warn_about_problematic_credentials(credentials):
         warnings.warn(_CLOUD_SDK_CREDENTIALS_WARNING)
 
 
+def _load_credentials_from_json(
+    json_content,
+    filename=None,
+    scopes=None,
+    default_scopes=None,
+    quota_project_id=None,
+    request=None,
+):
+    """Loads Google credentials from JSON.
+
+    The credentials JSON must be a service account key, stored authorized
+    user credentials or external account credentials.
+
+    Args:
+        json_content (Mapping[str, str]): The JSON content of the credentials.
+        filename (Optional[str]): The full path to the credentials file. If
+            specified, it will be used in exception messages.
+        scopes (Optional[Sequence[str]]): The list of scopes for the credentials. If
+            specified, the credentials will automatically be scoped if
+            necessary
+        default_scopes (Optional[Sequence[str]]): Default scopes passed by a
+            Google client library. Use 'scopes' for user-defined scopes.
+        quota_project_id (Optional[str]):  The project ID used for
+            quota and billing.
+        request (Optional[google.auth.transport.Request]): An object used to make
+            HTTP requests. This is used to determine the associated project ID
+            for a workload identity pool resource (external account credentials).
+            If not specified, then it will use a
+            google.auth.transport.requests.Request client to make requests.
+
+    Returns:
+        Tuple[google.auth.credentials.Credentials, Optional[str]]: Loaded
+            credentials and the project ID. Authorized user credentials do not
+            have the project ID information. External account credentials project
+            IDs may not always be determined.
+
+    Raises:
+        google.auth.exceptions.DefaultCredentialsError: if the file is in the
+            wrong format or is missing.
+    """
+    json_source = filename if filename else environment_vars.CREDENTIALS_JSON
+
+    # The type key should indicate that the file is either a service account
+    # credentials file or an authorized user credentials file.
+    credential_type = json_content.get("type")
+
+    if credential_type == _AUTHORIZED_USER_TYPE:
+        from google.oauth2 import credentials
+
+        try:
+            credentials = credentials.Credentials.from_authorized_user_info(
+                json_content, scopes=scopes
+            )
+        except ValueError as caught_exc:
+            msg = "Failed to load authorized user credentials from {}".format(
+                json_source
+            )
+            new_exc = exceptions.DefaultCredentialsError(msg, caught_exc)
+            six.raise_from(new_exc, caught_exc)
+        if quota_project_id:
+            credentials = credentials.with_quota_project(quota_project_id)
+        if not credentials.quota_project_id:
+            _warn_about_problematic_credentials(credentials)
+        return credentials, None
+
+    elif credential_type == _SERVICE_ACCOUNT_TYPE:
+        from google.oauth2 import service_account
+
+        try:
+            credentials = service_account.Credentials.from_service_account_info(
+                json_content, scopes=scopes, default_scopes=default_scopes
+            )
+        except ValueError as caught_exc:
+            msg = "Failed to load service account credentials from {}".format(
+                json_source
+            )
+            new_exc = exceptions.DefaultCredentialsError(msg, caught_exc)
+            six.raise_from(new_exc, caught_exc)
+        if quota_project_id:
+            credentials = credentials.with_quota_project(quota_project_id)
+        return credentials, json_content.get("project_id")
+
+    elif credential_type == _EXTERNAL_ACCOUNT_TYPE:
+        credentials, project_id = _get_external_account_credentials(
+            json_content,
+            filename,
+            scopes=scopes,
+            default_scopes=default_scopes,
+            request=request,
+        )
+        if quota_project_id:
+            credentials = credentials.with_quota_project(quota_project_id)
+        return credentials, project_id
+
+    else:
+        raise exceptions.DefaultCredentialsError(
+            "The {json_source} does not have a valid type. "
+            "Type is {type}, expected one of {valid_types}.".format(
+                json_source=json_source, type=credential_type, valid_types=_VALID_TYPES
+            )
+        )
+
+
 def load_credentials_from_file(
     filename, scopes=None, default_scopes=None, quota_project_id=None, request=None
 ):
@@ -120,61 +225,34 @@ def load_credentials_from_file(
             )
             six.raise_from(new_exc, caught_exc)
 
-    # The type key should indicate that the file is either a service account
-    # credentials file or an authorized user credentials file.
-    credential_type = info.get("type")
+    return _load_credentials_from_json(
+        info, filename, scopes, default_scopes, quota_project_id, request
+    )
 
-    if credential_type == _AUTHORIZED_USER_TYPE:
-        from google.oauth2 import credentials
 
-        try:
-            credentials = credentials.Credentials.from_authorized_user_info(
-                info, scopes=scopes
-            )
-        except ValueError as caught_exc:
-            msg = "Failed to load authorized user credentials from {}".format(filename)
-            new_exc = exceptions.DefaultCredentialsError(msg, caught_exc)
-            six.raise_from(new_exc, caught_exc)
-        if quota_project_id:
-            credentials = credentials.with_quota_project(quota_project_id)
-        if not credentials.quota_project_id:
-            _warn_about_problematic_credentials(credentials)
-        return credentials, None
+def _get_base64_encoded_json_credentials(quota_project_id=None):
+    """Gets the credentials and project ID from the GOOGLE_APPLICATION_CREDENTIALS_JSON
+    environment variable."""
+    _LOGGER.debug(
+        "Checking GOOGLE_APPLICATION_CREDENTIALS_JSON as part of auth process..."
+    )
 
-    elif credential_type == _SERVICE_ACCOUNT_TYPE:
-        from google.oauth2 import service_account
+    encoded_json = os.environ.get(environment_vars.CREDENTIALS_JSON)
+    if not encoded_json:
+        _LOGGER.debug("GOOGLE_APPLICATION_CREDENTIALS_JSON is not set; not using them")
+        return None, None
 
-        try:
-            credentials = service_account.Credentials.from_service_account_info(
-                info, scopes=scopes, default_scopes=default_scopes
-            )
-        except ValueError as caught_exc:
-            msg = "Failed to load service account credentials from {}".format(filename)
-            new_exc = exceptions.DefaultCredentialsError(msg, caught_exc)
-            six.raise_from(new_exc, caught_exc)
-        if quota_project_id:
-            credentials = credentials.with_quota_project(quota_project_id)
-        return credentials, info.get("project_id")
-
-    elif credential_type == _EXTERNAL_ACCOUNT_TYPE:
-        credentials, project_id = _get_external_account_credentials(
-            info,
-            filename,
-            scopes=scopes,
-            default_scopes=default_scopes,
-            request=request,
+    try:
+        json_str = base64.b64decode(encoded_json, validate=True).decode("utf8")
+        json_content = json.loads(json_str)
+    except (binascii.Error, json.JSONDecodeError) as caught_exc:
+        new_exc = exceptions.DefaultCredentialsError(
+            "GOOGLE_APPLICATION_CREDENTIALS_JSON is not valid base64 encoded json.",
+            caught_exc,
         )
-        if quota_project_id:
-            credentials = credentials.with_quota_project(quota_project_id)
-        return credentials, project_id
+        six.raise_from(new_exc, caught_exc)
 
-    else:
-        raise exceptions.DefaultCredentialsError(
-            "The file {file} does not have a valid type. "
-            "Type is {type}, expected one of {valid_types}.".format(
-                file=filename, type=credential_type, valid_types=_VALID_TYPES
-            )
-        )
+    return _load_credentials_from_json(json_content, quota_project_id=quota_project_id)
 
 
 def _get_gcloud_sdk_credentials(quota_project_id=None):
@@ -198,6 +276,23 @@ def _get_gcloud_sdk_credentials(quota_project_id=None):
         project_id = _cloud_sdk.get_project_id()
 
     return credentials, project_id
+
+
+def _get_fixed_access_token_credentials(quota_project_id=None):
+    """Gets the credentials and project ID from the GOOGLE_OAUTH_ACCESS_TOKEN environment variable."""
+    from google.oauth2 import credentials
+
+    _LOGGER.debug("Checking fixed access token credentials as part of auth process...")
+
+    access_token = os.environ.get(environment_vars.OAUTH_ACCESS_TOKEN)
+    if access_token is None:
+        _LOGGER.debug("GOOGLE_OAUTH_ACCESS_TOKEN not set; not using them")
+        return None, None
+
+    creds = credentials.FixedAccessTokenCredentials(
+        access_token, quota_project_id=quota_project_id
+    )
+    return creds, quota_project_id
 
 
 def _get_explicit_environ_credentials(quota_project_id=None):
@@ -455,6 +550,8 @@ def default(scopes=None, request=None, quota_project_id=None, default_scopes=Non
         # safely set on the returned credentials since requires_scopes will
         # guard against setting scopes on user credentials.
         lambda: _get_explicit_environ_credentials(quota_project_id=quota_project_id),
+        lambda: _get_base64_encoded_json_credentials(quota_project_id=quota_project_id),
+        lambda: _get_fixed_access_token_credentials(quota_project_id=quota_project_id),
         lambda: _get_gcloud_sdk_credentials(quota_project_id=quota_project_id),
         _get_gae_credentials,
         lambda: _get_gce_credentials(request),
